@@ -1729,7 +1729,56 @@ S.setPlayerOrder = function(p2First)
   trail(string.format("экран: порядок игроков %s — %s%s", p2First and "второй первым" or "обычный",
     held and "получилось" or "не получилось", ok and "" or (" (" .. tostring(err) .. ")")))
 end
+-- v9.15.13: ТРАССИРОВКА ЛУЧЕЙ И РАЗДЕЛЁННЫЙ ЭКРАН. С включённой в игре
+-- трассировкой лучей (RayTracingQuality) игра падала через 0–1 с после
+-- разделения экрана: все дампы (UE4Minidump.dmp) — в одном месте D3D12RHI, в
+-- параллельной привязке шейдеров попаданий (SetRayTracingHitGroup) с мусорным
+-- номером экземпляра; бывало и DXGI_ERROR_DEVICE_HUNG. Движок 4.27 с
+-- трассировкой для двух видов в одном кадре не справляется. Пока экран
+-- разделён, выключаем все эффекты трассировки (ForceAllRayTracingEffects 0) —
+-- за несколько кадров ДО появления второго вида; после возврата к общему
+-- экрану через полсекунды возвращаем как было (-1 — решает игра).
+-- Выключить это: split_disable_raytracing = false в settings.lua.
+S.rt = { off = false, restoreAt = nil }
+S.rt.cmd = function(v)
+  local lib = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+  if not valid(lib) then return false end
+  local ctx = valid(S.pc1) and S.pc1 or nil
+  local ok, err = pcall(function() lib:ExecuteConsoleCommand(ctx, "r.RayTracing.ForceAllRayTracingEffects " .. tostring(v), ctx) end)
+  local cur = "?"
+  pcall(function() cur = tostring(lib:GetConsoleVariableIntValue("r.RayTracing.ForceAllRayTracingEffects")) end)
+  trail(string.format("трассировка лучей: ForceAllRayTracingEffects %s → сейчас %s%s", tostring(v), cur, ok and "" or (" (ошибка " .. tostring(err) .. ")")))
+  return ok
+end
+S.rt.disable = function()
+  S.rt.restoreAt = nil
+  if S.rt.off or S.rt.failed or CFG.split_disable_raytracing == false then return end
+  if S.rt.cmd(0) then S.rt.off = true; S.rt.offFrame = S.frames
+  else S.rt.failed = true end   -- не пробуем каждый кадр
+end
+-- готов ли кадр к второму виду: трассировка выключена хотя бы 3 кадра назад
+S.rt.ready = function()
+  if CFG.split_disable_raytracing == false then return true end
+  if not S.rt.off then S.rt.disable() end
+  if not S.rt.off then return true end   -- не получилось выключить — не мешаем разделению
+  return S.frames - (S.rt.offFrame or 0) >= 3
+end
+S.rt.tick = function()
+  -- выключили перед разделением, но разделение не состоялось — тоже вернуть
+  if S.rt.off and not S.split and not S.rt.restoreAt and S.frames - (S.rt.offFrame or 0) > 60 then
+    S.rt.restoreAt = S.frames
+  end
+  if S.rt.off and not S.split and S.rt.restoreAt and S.frames >= S.rt.restoreAt then
+    S.rt.restoreAt = nil
+    if S.rt.cmd(-1) then S.rt.off = false end
+  end
+end
+S.rt.scheduleRestore = function()
+  if S.rt.off then S.rt.restoreAt = S.frames + 30 end
+end
 setSplitVisible = function(on)
+  -- второй вид без трассировки (на случай пути в обход updateSplit)
+  if on then pcall(S.rt.disable) else pcall(S.rt.scheduleRestore) end
   try("split visible", function()
     local g = gms()
     g.TwoPlayerSplitscreenLayout = S.layoutLR() and 1 or 0
@@ -1784,6 +1833,11 @@ local function updateSplit()
     trail(string.format("экран: хочу разделить, но после прошлого переключения прошло %.1f с", now() - S.splitChangedAt))
   end
   if want == S.split or now() - S.splitChangedAt < 1.0 then return end
+  -- v9.15.13: сначала выключаем трассировку лучей, второй вид — через пару кадров
+  if want then
+    local okR, ready = pcall(S.rt.ready)
+    if okR and not ready then return end
+  end
   S.splitChangedAt = now()
   if want then
     if not S.nativeCam then
@@ -7445,6 +7499,7 @@ local function Tick()
   TICKS = TICKS + 1
   S.frames = S.frames + 1
   if S.handsFree then pcall(S.handsFreeTick) end
+  pcall(S.rt.tick)
   -- первые 10 с после загрузки уровня — отметки шагов (если игра упадёт,
   -- последняя отметка в trail.txt покажет, на каком шаге)
   local crumb = S.crumbUntil and S.frames < S.crumbUntil and S.frames % 30 == 0
